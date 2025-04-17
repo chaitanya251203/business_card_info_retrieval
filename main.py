@@ -1,35 +1,39 @@
+# --- Imports ---
 import fastapi
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError # Added ValidationError
 import shutil
 import os
 import uuid
 import logging
 import re
 import io # Needed for reading file bytes
-
-# Image Processing imports (Optional for Google Vision but can keep)
-# from PIL import Image # No longer strictly needed if not using Tesseract's PIL conversion
-import cv2 # Still useful if you want to add preprocessing back later
-import numpy as np
+import json # Needed for loading credentials from JSON string
+from dotenv import load_dotenv # Import dotenv
+from typing import Annotated, List, Tuple, Dict, Any # For type hinting
 
 # spaCy import
 import spacy
 
 # Google Cloud Vision Import
 from google.cloud import vision
+from google.oauth2 import service_account # For loading creds from JSON content
+
+# --- Load Environment Variables ---
+# Load .env file BEFORE accessing os.environ below
+load_dotenv()
+logger_init = logging.getLogger(__name__) # Temp logger for startup
+logger_init.info("Attempted to load environment variables from .env file.")
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Tesseract configuration commented out (using Google Vision)
-# # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Use basicConfig AFTER load_dotenv potentially sets logging config vars
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Main logger
 
 # --- Load spaCy Model ---
-# Load the model once when the application starts for efficiency
+NLP_MODEL = None # Initialize global variable for the model
 try:
-    nlp = spacy.load("en_core_web_sm")
+    NLP_MODEL = spacy.load("en_core_web_sm")
     logger.info("spaCy model 'en_core_web_sm' loaded successfully.")
 except OSError:
     logger.error(
@@ -37,31 +41,45 @@ except OSError:
         "Please run 'python -m spacy download en_core_web_sm' "
         "in your virtual environment."
     )
-    nlp = None # Extraction function will check for this
+    # Extraction function will check if NLP_MODEL is None
+
+# --- Constants ---
+# Regex Patterns (Validated)
+EMAIL_REGEX = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{4,}\b'
+PHONE_PREFIX_REGEX = r'^[MFTWECP][\s:+]+'
+WEBSITE_REGEX = r'\b(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+)\b'
+NAME_STRUCTURE_REGEX = r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){1,2}$'
+
+# Keywords
+ADDRESS_KEYWORDS = ['Plot', 'Avenue', 'Street', 'Road', 'Drive', 'P.O. Box', 'Box', 'Floor', 'Suite', 'Ste', 'Building', 'St', 'Rd', 'Ave', 'Ln']
+COMPANY_SUFFIXES = ['Limited', 'Ltd', 'Inc', 'Corp', 'Solutions', 'Group', 'PLC', 'GmbH', 'LLC']
+COMPANY_KEYWORDS = ['Bank', 'Consulting', 'Media', 'Tech', 'Logistics', 'Holdings', 'Industries', 'Enterprises']
+JOB_TITLE_KEYWORDS = ['Officer', 'Manager', 'Director', 'Assistant', 'Engineer', 'Sales', 'Marketing', 'CEO', 'CTO', 'President', 'Specialist', 'Consultant', 'Analyst', 'Services', 'Executive', 'Representative', 'Procurement', 'Head']
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Business Card Scanner API",
     description="Upload a business card image to extract information using Google Cloud Vision OCR + spaCy NER.",
-    version="1.3.0", # Updated version number
+    version="1.3.3", # Updated version number reflecting fixes
 )
 
-# --- Pydantic Model for Response (Includes job_title, excludes raw_text) ---
+# --- Pydantic Model for Response ---
 class CardInfo(BaseModel):
     company_name: str | None = None
     company_type: str | None = None
     person_name: str | None = None
-    job_title: str | None = None # Added job title field
-    phone_number: str | None = None
+    job_title: str | None = None
+    phone_number: str | None = None # Primary phone number
     email: str | None = None
+    website: str | None = None # Added website
     address: str | None = None
-    # raw_text field is removed
 
 # --- File Handling Setup ---
 UPLOAD_DIR = "temp_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# --- Image Preprocessing Function (Just reads bytes for Google Vision) ---
+# --- Image Preprocessing Function ---
 def preprocess_image(image_path: str) -> bytes:
     """Loads image and returns its byte content."""
     try:
@@ -73,24 +91,43 @@ def preprocess_image(image_path: str) -> bytes:
         logger.error(f"Error reading image file {image_path}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to read image file: {e}")
 
-# --- Google Cloud Vision OCR Function ---
+# --- Google Cloud Vision OCR Function (with Correct Credential Handling) ---
 def perform_ocr_google(image_path: str) -> str:
     """Performs OCR on an image file using Google Cloud Vision API."""
     try:
         logger.info(f"Performing Google Cloud Vision OCR on: {image_path}")
-        client = vision.ImageAnnotatorClient()
+        # --- Start Credential Handling ---
+        client = None
+        creds_path_or_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not creds_path_or_json:
+             logger.error("GOOGLE_APPLICATION_CREDENTIALS environment variable not set.")
+             raise ValueError("Google Credentials not configured.")
+
+        if os.path.isfile(creds_path_or_json): # Local dev: Path provided
+             logger.info("Using Google credentials from file path specified in ENV.")
+             client = vision.ImageAnnotatorClient() # SDK handles path automatically
+        else: # Deployed: Assume JSON content in ENV var
+             logger.info("Attempting to load Google credentials from ENV variable content.")
+             try:
+                 credentials_dict = json.loads(creds_path_or_json)
+                 credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+                 client = vision.ImageAnnotatorClient(credentials=credentials)
+                 logger.info("Successfully loaded Google credentials from ENV content.")
+             except Exception as cred_err:
+                  logger.error(f"Failed to parse/load Google credentials from ENV variable content: {cred_err}")
+                  raise ValueError(f"Invalid Google Credentials JSON in environment variable: {cred_err}")
+        # --- End Credential Handling ---
+
+        if client is None: # Safeguard
+             raise ValueError("Failed to initialize Google Vision client.")
 
         content = preprocess_image(image_path)
         image = vision.Image(content=content)
-
         response = client.document_text_detection(image=image)
 
         if response.error.message:
             logger.error(f"Google Cloud Vision API error: {response.error.message}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Google Cloud Vision API error: {response.error.message}"
-            )
+            raise HTTPException(status_code=500, detail=f"Google Cloud Vision API error: {response.error.message}")
 
         if response.full_text_annotation:
             extracted_text = response.full_text_annotation.text
@@ -99,227 +136,286 @@ def perform_ocr_google(image_path: str) -> str:
         else:
             logger.warning("Google Cloud Vision did not detect any text.")
             return ""
-    except HTTPException as http_exc: # Pass through HTTP exceptions from preprocessing
+    except HTTPException as http_exc:
         raise http_exc
+    except ValueError as val_err: # Catch credential config errors
+         logger.error(f"Configuration error during OCR: {val_err}", exc_info=True)
+         raise HTTPException(status_code=500, detail=f"Server Configuration Error: {val_err}")
     except Exception as e:
         logger.error(f"Error during Google Cloud OCR processing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
 
-# --- Information Extraction Function (spaCy + Regex + Job Title) ---
-def extract_information_spacy(text: str) -> dict:
-    """
-    Extracts information using spaCy NER + Regex, including Job Title.
-    (Corrected version ensuring break statement is within its loop)
-    """
-    logger.info("Starting information extraction with Job Title detection.")
 
-    if nlp is None:
-        logger.error("spaCy model 'nlp' object is None. Cannot perform NER.")
-        return {
-            "company_name": None, "company_type": None, "person_name": None,
-            "job_title": None, "phone_number": None, "email": None, "address": None,
-            "_error": "spaCy model not loaded"
-        }
+# --- Helper Functions for Information Extraction ---
 
-    data = {
-        "company_name": None, "company_type": None, "person_name": None,
-        "job_title": None, "phone_number": None, "email": None, "address": None,
-    }
-
-    # --- Text Cleaning ---
-    text = re.sub(r'\s{2,}', ' ', text.strip())
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
+def _clean_text(text: str) -> tuple[str, list[str], list[str]]:
+    """Basic text cleaning and line splitting."""
+    text_cleaned = re.sub(r'\s{2,}', ' ', text.strip())
+    lines = [line.strip() for line in text_cleaned.split('\n') if line.strip()]
     lines_lower = [line.lower() for line in lines]
+    return text_cleaned, lines, lines_lower
 
-    # --- Regex Definitions ---
-    email_regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    phone_regex = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,}\b'
-    phone_prefix_regex = r'^[MFTWECP][\s:+]+'
-
-    # --- Initial Regex Extraction ---
-    emails_found = re.findall(email_regex, text)
-    phones_found = re.findall(phone_regex, text)
-
+def _extract_emails(text: str) -> str | None:
+    """Extracts the most likely email address."""
+    emails_found = re.findall(EMAIL_REGEX, text)
     if emails_found:
-        data['email'] = emails_found[0]
-        logger.info(f"Regex assigned email: {data['email']}")
+        logger.info(f"Regex found email(s): {emails_found}")
+        return emails_found[0]
+    return None
 
-    if phones_found: # Score and select best phone
-        scored_phones = []
+def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]]:
+    """Extracts phone numbers, scores them, returns primary and all found."""
+    phones_found = re.findall(PHONE_REGEX, text)
+    scored_phones = []; all_phones_details = []
+    if phones_found:
         for phone in phones_found:
             cleaned_phone = re.sub(r'[^\d+() -]', '', phone).strip()
             digit_count = sum(c.isdigit() for c in cleaned_phone)
             if digit_count >= 7:
-                score = digit_count
+                score = digit_count; context = "Other"
                 for line_idx, line in enumerate(lines):
                     if cleaned_phone in line:
-                         if re.match(phone_prefix_regex, line.strip(), re.IGNORECASE): score += 10
-                         if line_idx > len(lines) / 2: score += 2
-                         break # Correct break: from inner line search loop
+                        line_strip = line.strip()
+                        prefix_match = re.match(PHONE_PREFIX_REGEX, line_strip, re.IGNORECASE)
+                        if prefix_match:
+                            score += 10; prefix = prefix_match.group(0)[0].upper()
+                            if prefix == 'M': context = "Mobile"
+                            elif prefix == 'F': context = "Fax"
+                            elif prefix == 'T': context = "Tel"
+                            elif prefix == 'P': context = "Phone"
+                        if line_idx > len(lines) / 2: score += 2
+                        break # Break from inner line search loop
                 scored_phones.append((score, cleaned_phone))
-        if scored_phones:
-            scored_phones.sort(key=lambda x: x[0], reverse=True)
-            data['phone_number'] = scored_phones[0][1]
-            logger.info(f"Regex assigned phone (score {scored_phones[0][0]}): {data['phone_number']}")
+                all_phones_details.append({"number": cleaned_phone, "type": context, "score": score})
+    primary_phone = None
+    if scored_phones:
+        scored_phones.sort(key=lambda x: x[0], reverse=True)
+        primary_phone = scored_phones[0][1]
+        logger.info(f"Regex assigned primary phone (score {scored_phones[0][0]}): {primary_phone}")
+    all_phones_details.sort(key=lambda x: x['score'], reverse=True)
+    return primary_phone, all_phones_details
 
-    # --- spaCy NER Processing ---
-    doc = nlp(text)
+def _extract_websites(text: str) -> str | None:
+    """Extracts the first likely website."""
+    websites_found = re.findall(WEBSITE_REGEX, text)
+    if websites_found:
+        first_domain_match = websites_found[0]; full_url = first_domain_match
+        if f"www.{first_domain_match}" in text.lower(): full_url = f"www.{first_domain_match}"
+        elif f"https://{first_domain_match}" in text.lower(): full_url = f"https://{first_domain_match}"
+        elif f"http://{first_domain_match}" in text.lower(): full_url = f"http://{first_domain_match}"
+        elif re.search(r'^[Ww][\s:.]+\s*' + re.escape(first_domain_match), text, re.MULTILINE): full_url = f"www.{first_domain_match}"
+        logger.info(f"Regex found website(s): {websites_found} -> Assigned: {full_url}")
+        return full_url
+    return None
+
+def _find_person(doc: spacy.tokens.Doc, extracted_data: dict) -> tuple[str | None, int]:
+    """Finds the most likely person name using spaCy PERSON entities."""
     persons = [ent for ent in doc.ents if ent.label_ == "PERSON"]
-    orgs = [ent for ent in doc.ents if ent.label_ == "ORG"]
-    locations = [ent for ent in doc.ents if ent.label_ in ["GPE", "LOC", "FAC"]]
-    logger.info(f"spaCy found {len(persons)} PERSON, {len(orgs)} ORG, {len(locations)} location entities.")
-
-    # --- Assign Person Name ---
-    person_name_line_index = -1
-    person_name_assigned = None
+    person_name_assigned = None; person_name_line_index = -1
     if persons:
         scored_persons = []
         for i, person_ent in enumerate(persons):
             name = person_ent.text.strip()
-            if (data['email'] and name in data['email']) or \
-               (data['phone_number'] and name in data['phone_number']) or \
-               sum(c.isdigit() for c in name) > 0 or \
-               len(name.split()) > 4 or len(name.split()) < 2: continue
+            # Filters
+            if (extracted_data['email'] and name in extracted_data['email']) or \
+               (extracted_data['phone_number'] and name in extracted_data['phone_number']) or \
+               sum(c.isdigit() for c in name) > 0 or len(name.split()) > 4 or len(name.split()) < 2: continue
+            # Scoring
             score = len(name)
-            if re.fullmatch(r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){0,2}$', name): score += 10
-            line_idx = -1
-            try: start_char = person_ent.start_char; line_idx = text[:start_char].count('\n');
+            if re.fullmatch(NAME_STRUCTURE_REGEX, name): score += 10
+            line_idx = -1;
+            try: start_char = person_ent.start_char; line_idx = doc.text[:start_char].count('\n');
             except Exception: pass
-            if line_idx != -1 and line_idx < len(lines) / 3: score += 5
+            if line_idx != -1 and line_idx < len(doc.text.split('\n')) / 3: score += 5
             scored_persons.append((score, name, line_idx))
         if scored_persons:
              scored_persons.sort(key=lambda x: x[0], reverse=True)
-             data['person_name'] = scored_persons[0][1]
+             person_name_assigned = scored_persons[0][1]
              person_name_line_index = scored_persons[0][2]
-             person_name_assigned = data['person_name']
-             logger.info(f"spaCy assigned PERSON (score {scored_persons[0][0]}): {data['person_name']} around line {person_name_line_index}")
+             logger.info(f"spaCy assigned PERSON (score {scored_persons[0][0]}): {person_name_assigned} around line {person_name_line_index}")
+    return person_name_assigned, person_name_line_index
 
-    # --- Assign Job Title ---
-    job_title_keywords = ['Officer', 'Manager', 'Director', 'Assistant', 'Engineer', 'Sales', 'Marketing', 'CEO', 'CTO', 'President', 'Specialist', 'Consultant', 'Analyst', 'Services', 'Executive', 'Representative', 'Procurement']
+def _find_job_title(lines: list[str], lines_lower: list[str], person_name: str | None, person_name_line_index: int, extracted_data: dict) -> str | None:
+    """Finds the job title, often near the person's name."""
     job_title_assigned = None
-    if person_name_assigned and person_name_line_index != -1:
+    if person_name and person_name_line_index != -1:
         start_search_index = max(0, person_name_line_index)
         end_search_index = min(len(lines), start_search_index + 3)
-        for i in range(start_search_index, end_search_index): # Loop for job title search
+        for i in range(start_search_index, end_search_index): # Loop to find title
             line = lines[i]; line_lower = lines_lower[i]
-            if any(keyword.lower() in line_lower for keyword in job_title_keywords):
-                 if line != person_name_assigned and \
-                    not (data['email'] and data['email'] in line) and \
-                    not (data['phone_number'] and data['phone_number'] in line) and \
-                    len(line.split()) < 6:
-                      data['job_title'] = line
-                      job_title_assigned = data['job_title']
-                      logger.info(f"Assigned Job Title: {data['job_title']}")
-                      break # Correct break: Stop searching for title once found
-        # No 'else' needed here, if loop finishes without break, no title assigned
+            if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS):
+                 if line != person_name and \
+                    not (extracted_data['email'] and extracted_data['email'] in line) and \
+                    not (extracted_data['phone_number'] and extracted_data['phone_number'] in line) and \
+                    not (extracted_data.get('company_name') and extracted_data['company_name'] in line) and \
+                    len(line.split()) < 7:
+                      job_title_assigned = line
+                      logger.info(f"Assigned Job Title: {job_title_assigned}")
+                      break # Break from title search loop
+    return job_title_assigned
 
-    # --- Assign Company Name & Type ---
-    company_name_assigned = None
+def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | None, str | None]:
+    """Finds the most likely organization name and type using spaCy ORG entities."""
+    orgs = [ent for ent in doc.ents if ent.label_ == "ORG"]
+    company_name_assigned = None; company_type_assigned = None
     if orgs:
         scored_orgs = []
-        company_suffixes = ['Limited', 'Ltd', 'Inc', 'Corp', 'Solutions', 'Group', 'PLC']; company_keywords = ['Bank', 'Consulting', 'Media', 'Tech', 'Logistics']
         for org_ent in orgs: # Loop through potential orgs
             org_name = org_ent.text.strip(); type_found_in_scoring = None
-            if (person_name_assigned and org_name == person_name_assigned) or len(org_name) < 4: continue
+            if (person_name and org_name == person_name) or len(org_name) < 3: continue
             score = len(org_name)
-            for suffix in company_suffixes: # Inner loop to check suffixes for scoring
+            for suffix in COMPANY_SUFFIXES: # Inner loop 1
                  if re.search(r'\b' + re.escape(suffix) + r'\b', org_name, re.IGNORECASE):
                      score += 20; type_found_in_scoring = suffix;
-                     break # Correct break: from suffix checking loop for scoring
+                     break # Correct break
             if not type_found_in_scoring:
-                for keyword in company_keywords: # Inner loop to check keywords for scoring
+                for keyword in COMPANY_KEYWORDS: # Inner loop 2
                     if re.search(r'\b' + re.escape(keyword) + r'\b', org_name, re.IGNORECASE):
                         score += 10;
-                        break # Correct break: from keyword checking loop for scoring
-            scored_orgs.append((score, org_name, type_found_in_scoring)) # Note: type_found_in_scoring is just a hint
-
+                        break # Correct break
+            scored_orgs.append((score, org_name, type_found_in_scoring))
         if scored_orgs:
              scored_orgs.sort(key=lambda x: x[0], reverse=True)
-             best_org_name = scored_orgs[0][1]
-             best_org_type_guess = scored_orgs[0][2] # This was the suffix found during scoring (if any)
+             best_org_name = scored_orgs[0][1]; best_org_type_guess = scored_orgs[0][2]
              final_type = None; cleaned_org_name = best_org_name
-
-             # Re-check the chosen best_org_name accurately for the suffix
-             if best_org_type_guess: # Start check with the guess from scoring
+             if best_org_type_guess:
                  match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
                  if match: final_type = match.group(0)
-
-             if not final_type: # If scoring guess wasn't right or none found, check all suffixes again
-                  for suffix in company_suffixes: # <<< This is the relevant loop for the Pylance error
+             if not final_type:
+                  for suffix in COMPANY_SUFFIXES: # Inner loop 3
                       match = re.search(r'\b' + re.escape(suffix) + r'\b', best_org_name, re.IGNORECASE);
                       if match:
-                          final_type = match.group(0)
-                          # --- THIS IS THE BREAK STATEMENT IN QUESTION ---
-                          # It is correctly inside the 'for suffix in company_suffixes:' loop.
-                          break
-             # --- END OF SECTION FOR THE BREAK ---
-
+                          final_type = match.group(0);
+                          break # Correct break
              if final_type:
-                 data['company_type'] = final_type;
+                 company_type_assigned = final_type;
                  cleaned_org_name = re.sub(r'\b' + re.escape(final_type) + r'\b', '', cleaned_org_name, flags=re.IGNORECASE).strip(' ,')
-             data['company_name'] = cleaned_org_name.strip();
-             company_name_assigned = data['company_name'];
-             logger.info(f"spaCy assigned ORG (score {scored_orgs[0][0]}): {data['company_name']} (Type: {data['company_type']})")
+             company_name_assigned = cleaned_org_name.strip();
+             logger.info(f"spaCy assigned ORG (score {scored_orgs[0][0]}): {company_name_assigned} (Type: {company_type_assigned})")
+    return company_name_assigned, company_type_assigned
 
-    # --- Address Assembly ---
-    # (Keep Address logic from previous version)
-    address_keywords = ['Plot', 'Avenue', 'Street', 'Road', 'Drive', 'P.O. Box', 'Box', 'Floor', 'Suite', 'Ste', 'Building', 'St', 'Rd', 'Ave', 'Ln']
+def _assemble_address(lines: list[str], lines_lower: list[str], locations: list[spacy.tokens.Token], data: dict) -> str | None:
+    """Assembles the address from relevant lines, filtering out other data."""
     address_parts = []; location_texts = {loc.text.strip().lower() for loc in locations if len(loc.text.strip()) > 2}
-    for line in lines:
+    person_name_assigned = data.get('person_name'); job_title_assigned = data.get('job_title'); company_name_assigned = data.get('company_name'); company_type_assigned = data.get('company_type'); email_assigned = data.get('email'); phone_assigned = data.get('phone_number'); website_assigned = data.get('website')
+    for i, line in enumerate(lines):
+        line_lower = lines_lower[i]
+        # Filter assigned fields
         is_assigned_field = (person_name_assigned and line == person_name_assigned) or \
                            (job_title_assigned and line == job_title_assigned) or \
-                           (company_name_assigned and data['company_type'] is None and line == company_name_assigned) or \
-                           (company_name_assigned and data['company_type'] and data['company_type'] in line and company_name_assigned in line) or \
-                           (data['email'] and line == data['email']) or \
-                           (data['phone_number'] and data['phone_number'] in line)
+                           (company_name_assigned and company_type_assigned is None and line == company_name_assigned) or \
+                           (company_name_assigned and company_type_assigned and company_type_assigned in line and company_name_assigned in line) or \
+                           (email_assigned and line == email_assigned) or \
+                           (phone_assigned and phone_assigned in line) or \
+                           (website_assigned and website_assigned in line)
         if is_assigned_field: continue
-        line_cleaned_prefixes = re.sub(phone_prefix_regex, '', line).strip()
-        if re.fullmatch(phone_regex, line_cleaned_prefixes) or re.fullmatch(email_regex, line): continue
-        if any(keyword.lower() in line.lower() for keyword in job_title_keywords) and \
-           not any(addr_kw.lower() in line.lower() for addr_kw in address_keywords): continue
-        line_lower = line.lower()
-        if any(keyword.lower() in line_lower for keyword in address_keywords) or \
+        # Filter lines that look like only phone/email/titles/websites
+        line_cleaned_prefixes = re.sub(PHONE_PREFIX_REGEX, '', line).strip()
+        if re.fullmatch(PHONE_REGEX, line_cleaned_prefixes) or re.fullmatch(EMAIL_REGEX, line) or re.fullmatch(WEBSITE_REGEX, line): continue
+        if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS) and \
+           not any(addr_kw.lower() in line_lower for addr_kw in ADDRESS_KEYWORDS): continue
+        # Check for Address Clues
+        if any(keyword.lower() in line_lower for keyword in ADDRESS_KEYWORDS) or \
            re.search(r'\b\d{4,}\b', line) or \
            any(loc_text in line_lower for loc_text in location_texts):
              address_parts.append(line.strip(':., '))
+    # Deduplicate and Join
     unique_address_parts = []; seen = set()
     for part in address_parts: part_lower = part.lower();
     if part_lower not in seen: unique_address_parts.append(part); seen.add(part_lower)
     if unique_address_parts:
         address_string = ", ".join(unique_address_parts);
+        # Final cleaning
         if company_name_assigned and company_name_assigned in address_string: address_string = address_string.replace(company_name_assigned, '').strip(' ,')
-        if data['company_type'] and data['company_type'] in address_string: address_string = address_string.replace(data['company_type'], '').strip(' ,')
+        if company_type_assigned and company_type_assigned in address_string: address_string = address_string.replace(company_type_assigned, '').strip(' ,')
+        if job_title_assigned and job_title_assigned in address_string: address_string = address_string.replace(job_title_assigned, '').strip(' ,')
         address_string = re.sub(r'\s{2,}', ' ', address_string).strip(' ,')
-        data['address'] = address_string
-        logger.info(f"Assembled address (filtered): {data['address']}")
+        if address_string: logger.info(f"Assembled address (filtered): {address_string}"); return address_string
+    logger.info("No address assembled.")
+    return None
+
+# --- Main Extraction Function (Refactored) ---
+def extract_information_spacy(text: str) -> dict:
+    """
+    Extracts information using spaCy NER + Regex, refactored with helper functions.
+    """
+    logger.info("Starting information extraction (Refactored v1.3.3).")
+    if NLP_MODEL is None: # Check global NLP_MODEL
+        logger.error("spaCy model 'NLP_MODEL' object is None. Cannot perform NER.")
+        return {"_error": "spaCy model not loaded"}
+
+    data = { # Initialize with all keys expected by CardInfo
+        "company_name": None, "company_type": None, "person_name": None,
+        "job_title": None, "phone_number": None, "email": None,
+        "website": None, "address": None,
+    }
+    # Use _clean_text helper
+    text_cleaned, lines, lines_lower = _clean_text(text)
+    if not text_cleaned:
+        logger.warning("OCR text is empty after cleaning.")
+        return data # Return empty data
+
+    # Process with spaCy
+    doc = NLP_MODEL(text_cleaned) # Use global NLP_MODEL
+    persons = [ent for ent in doc.ents if ent.label_ == "PERSON"]
+    orgs = [ent for ent in doc.ents if ent.label_ == "ORG"]
+    locations = [ent for ent in doc.ents if ent.label_ in ["GPE", "LOC", "FAC"]]
+    logger.info(f"spaCy found {len(persons)} PERSON, {len(orgs)} ORG, {len(locations)} location entities.")
+
+    # Extract simple patterns first
+    data['email'] = _extract_emails(text_cleaned)
+    data['phone_number'], _ = _extract_phones(text_cleaned, lines)
+    data['website'] = _extract_websites(text_cleaned)
+
+    # Find person (pass doc and current data for context)
+    person_name_assigned, person_name_line_index = _find_person(doc, data)
+    data['person_name'] = person_name_assigned
+
+    # Find organization (pass doc and person name for filtering)
+    company_name_assigned, company_type_assigned = _find_org(doc, person_name_assigned)
+    data['company_name'] = company_name_assigned
+    data['company_type'] = company_type_assigned
+
+    # Find job title (pass lines, person info, and current data)
+    data['job_title'] = _find_job_title(lines, lines_lower, person_name_assigned, person_name_line_index, data)
+
+    # Assemble address (pass lines, locations, and all extracted data for filtering)
+    data['address'] = _assemble_address(lines, lines_lower, locations, data)
 
     logger.info(f"Information extraction finished. Data: {data}")
+    # Remove internal error key before returning if present
+    data.pop("_error", None)
     return data
 
 
-# --- API Endpoint (Corrected try/finally structure) ---
+# --- API Endpoint (No Database) ---
 @app.post("/scan-card/", response_model=CardInfo)
-async def scan_business_card(file: UploadFile = File(..., description="Business card image file (JPEG, PNG recommended).")):
+async def scan_business_card(
+    file: UploadFile = File(..., description="Business card image file (JPEG, PNG recommended).")
+    # No database dependency needed or injected
+):
     """
-    Receives a business card image, performs OCR (Google Vision), extracts info, returns JSON.
+    Receives card image, performs OCR (Google Vision), extracts info, returns JSON.
+    (No database interaction)
     """
     if not file.content_type.startswith("image/"):
         logger.warning(f"Invalid file type uploaded: {file.content_type}")
         raise HTTPException(status_code=400, detail=f"Invalid file type '{file.content_type}'. Please upload an image.")
 
-    temp_file_path = None # Initialize to ensure cleanup check works
+    temp_file_path = None
+    original_filename = file.filename
+
     try:
-        # --- File Saving and Processing ---
-        file_extension = os.path.splitext(file.filename)[1] or '.png' # Ensure extension
+        file_extension = os.path.splitext(original_filename)[1] or '.png'
         temp_file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}{file_extension}")
-        logger.info(f"Received file: {file.filename}. Saving temporarily to: {temp_file_path}")
+        logger.info(f"Received file: {original_filename}. Saving temporarily to: {temp_file_path}")
 
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         logger.info("Temporary file saved successfully.")
 
         # --- OCR ---
-        raw_text_from_ocr = perform_ocr_google(temp_file_path)
+        raw_text_from_ocr = perform_ocr_google(temp_file_path) # Using Google Vision
 
         # --- Information Extraction ---
         extracted_data = extract_information_spacy(raw_text_from_ocr)
@@ -330,54 +426,50 @@ async def scan_business_card(file: UploadFile = File(..., description="Business 
              logger.error(f"Information extraction failed: {error_msg}")
              raise HTTPException(status_code=500, detail=f"Information extraction failed: {error_msg}")
 
-        # --- Return Response ---
-        # Pydantic model validation handles the exclusion of raw_text and inclusion of job_title
-        return CardInfo(**extracted_data)
+        # --- Prepare and Return Response ---
+        try:
+             # Validate and structure the response using the Pydantic model
+             card_info_response = CardInfo(**extracted_data)
+             return card_info_response
+        except ValidationError as pydantic_err:
+             logger.error(f"Pydantic validation failed for extracted data: {extracted_data}. Error: {pydantic_err}", exc_info=True)
+             # Include more detail from the validation error if possible
+             raise HTTPException(status_code=422, detail=f"Validation failed for extracted data: {pydantic_err.errors()}")
 
     except HTTPException as http_exc:
-        # Re-raise specific HTTP errors (from OCR, preprocessing, etc.)
         logger.warning(f"HTTP Exception during processing: {http_exc.status_code} - {http_exc.detail}")
         raise http_exc
     except Exception as e:
-        # Catch any other unexpected errors
-        logger.error(f"An unexpected error occurred processing file {file.filename}: {e}", exc_info=True)
+        logger.error(f"An unexpected error occurred processing file {original_filename}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
     finally:
-        # --- Cleanup: Ensure the temporary file is always deleted ---
-        # This block now correctly corresponds to the outer try
+        # --- Cleanup ---
         if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-                logger.info(f"Temporary file deleted: {temp_file_path}")
-            except OSError as e:
-                logger.error(f"Error deleting temporary file {temp_file_path}: {e}")
-        # Ensure the uploaded file stream is closed
+            try: os.remove(temp_file_path); logger.info(f"Temporary file deleted: {temp_file_path}")
+            except OSError as e: logger.error(f"Error deleting temporary file {temp_file_path}: {e}")
         if file and hasattr(file, 'file') and not file.file.closed:
-            try:
-                 await file.close()
-                 logger.info("Closed uploaded file stream.")
-            except Exception as e:
-                 logger.error(f"Error closing uploaded file stream: {e}")
-
+            try: await file.close(); logger.info("Closed uploaded file stream.")
+            except Exception as e: logger.error(f"Error closing uploaded file stream: {e}")
 
 # --- Root endpoint ---
 @app.get("/", include_in_schema=False)
 def read_root():
     """Provides a simple welcome message for the API root."""
-    return {"message": "Business Card Scanner API v1.3 (Google Vision + Job Title) is running. Go to /docs for API documentation."}
+    return {"message": "Business Card Scanner API v1.3.3 (No DB) is running. Go to /docs for API documentation."}
 
 # --- Main execution block ---
 if __name__ == "__main__":
+    # --- No Database Table Creation Call Here ---
+
     import uvicorn
-    logger.info("Starting Business Card Scanner API server (v1.3 Google Vision + Job Title)...")
-    # Check environment variable
+    logger.info("Starting Business Card Scanner API server (v1.3.3 No DB)...")
+    # Environment variable checks
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
          logger.warning("GOOGLE_APPLICATION_CREDENTIALS environment variable not set. Google Cloud Vision API calls will likely fail.")
     else:
          logger.info("GOOGLE_APPLICATION_CREDENTIALS environment variable is set.")
-    # Check spaCy model
-    if nlp is None:
+    if NLP_MODEL is None: # Check global variable used by extraction function
         logger.warning("spaCy model failed to load during startup. NER features will be unavailable.")
 
     # Run the server
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) # Keep reload=True for local dev
