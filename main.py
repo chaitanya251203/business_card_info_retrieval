@@ -164,34 +164,63 @@ def _extract_emails(text: str) -> str | None:
     return None
 
 def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]]:
-    """Extracts phone numbers, scores them, returns primary and all found."""
+    """
+    Extracts phone numbers from text, scores them based on context,
+    and returns the most relevant (primary) phone number and a list of all found numbers with details.
+
+    Args:
+        text (str): The full text content to search within.
+        lines (list[str]): The text split into lines, used for context scoring.
+
+    Returns:
+        tuple[str | None, list[dict]]: Primary phone number and list of all found phones with metadata.
+    """
     phones_found = re.findall(PHONE_REGEX, text)
-    scored_phones = []; all_phones_details = []
+    scored_phones = []
+    all_phones_details = []
+
     if phones_found:
         for phone in phones_found:
             cleaned_phone = re.sub(r'[^\d+() -]', '', phone).strip()
             digit_count = sum(c.isdigit() for c in cleaned_phone)
-            if digit_count >= 7:
-                score = digit_count; context = "Other"
+
+            if digit_count >= 7:  # Basic validity check
+                score = digit_count
+                context = "Other"
+
+                # Check line context for prefixes
                 for line_idx, line in enumerate(lines):
                     if cleaned_phone in line:
                         line_strip = line.strip()
                         prefix_match = re.match(PHONE_PREFIX_REGEX, line_strip, re.IGNORECASE)
                         if prefix_match:
-                            score += 10; prefix = prefix_match.group(0)[0].upper()
-                            if prefix == 'M': context = "Mobile"
-                            elif prefix == 'F': context = "Fax"
-                            elif prefix == 'T': context = "Tel"
-                            elif prefix == 'P': context = "Phone"
-                        if line_idx > len(lines) / 2: score += 2
-                        break # Break from inner line search loop
+                            score += 10  # Boost score
+                            prefix = prefix_match.group(1).upper()
+                            if prefix == 'M':
+                                context = "Mobile"
+                            elif prefix == 'F':
+                                context = "Fax"
+                            elif prefix == 'T':
+                                context = "Tel"
+                            elif prefix == 'P':
+                                context = "Phone"
+                        if line_idx > len(lines) / 2:
+                            score += 2  # Slight boost if lower down
+                        break  # Stop searching lines for this phone
+
                 scored_phones.append((score, cleaned_phone))
-                all_phones_details.append({"number": cleaned_phone, "type": context, "score": score})
+                all_phones_details.append({
+                    "number": cleaned_phone,
+                    "type": context,
+                    "score": score
+                })
+
     primary_phone = None
     if scored_phones:
-        scored_phones.sort(key=lambda x: x[0], reverse=True)
+        scored_phones.sort(key=lambda x: x[0], reverse=True)  # Sort by score descending
         primary_phone = scored_phones[0][1]
         logger.info(f"Regex assigned primary phone (score {scored_phones[0][0]}): {primary_phone}")
+
     all_phones_details.sort(key=lambda x: x['score'], reverse=True)
     return primary_phone, all_phones_details
 
