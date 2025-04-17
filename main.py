@@ -48,7 +48,7 @@ except OSError:
 EMAIL_REGEX = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,}\b' # Changed last part to \d{3,}
 PHONE_PREFIX_REGEX = r'^[MFTWECP][\s:+]+'
-WEBSITE_REGEX = r'\b(?<![@\w])(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+)\b'
+WEBSITE_REGEX = r'\b(?<![@\w])(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z0-9.-]+))\b'
 NAME_STRUCTURE_REGEX = r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){1,2}$'
 
 # Keywords
@@ -225,28 +225,31 @@ def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]
     return primary_phone, all_phones_details
 
 def _extract_websites(text: str) -> str | None:
-    """Extracts the first likely website using the refined regex."""
+    """Extracts the first likely website using the revised regex."""
     # Find all matches using the refined regex
-    matches = list(re.finditer(WEBSITE_REGEX, text))
+    matches = list(re.finditer(WEBSITE_REGEX, text)) # Uses the updated constant
     if not matches:
         return None
 
-    # Simple approach: take the first match found. Could add scoring later.
     first_match = matches[0]
-    domain_match = first_match.group(1) # The core domain part captured
-    full_match_text = first_match.group(0).strip() # The whole matched string
+    # Group 1 should capture the domain name + TLD, like 'somaiya.com' or 'google.co.uk'
+    domain_match = first_match.group(1)
+    full_match_text = first_match.group(0).strip() # The originally matched text e.g. 'www. somaiya.com'
 
-    # Reconstruct preferred format (e.g., include www. if present)
-    full_url = domain_match # Default to domain
+    # Reconstruct preferred format
+    full_url = domain_match # Default to domain part
     if full_match_text.lower().startswith("www."):
-        full_url = full_match_text
+        full_url = full_match_text # Keep www. if originally present
     elif full_match_text.lower().startswith("https://"):
-        full_url = full_match_text
+        full_url = full_match_text # Keep scheme if present
     elif full_match_text.lower().startswith("http://"):
-        full_url = full_match_text
-    # Check for W: prefix which might indicate www
+        full_url = full_match_text # Keep scheme if present
+    # Check for W: prefix if no other prefix found
     elif re.search(r'^[Ww][\s:.]+\s*' + re.escape(domain_match), text, re.MULTILINE):
-         full_url = f"www.{domain_match}" # Assume www if prefixed
+         full_url = f"www.{domain_match}"
+
+    # Clean potential extra space after www. if regex allowed it
+    full_url = full_url.replace("www. ", "www.")
 
     logger.info(f"Regex found potential website: {full_url}")
     return full_url
@@ -451,12 +454,28 @@ def extract_information_spacy(text: str) -> dict:
 
     # --- Website Filtering ---
     # Check if the extracted website overlaps with the email address
-    if extracted_website and data['email'] and \
-       (extracted_website in data['email'] or data['email'] in extracted_website):
-        logger.warning(f"Ignoring potential website '{extracted_website}' as it overlaps with email '{data['email']}'.")
-        data['website'] = None
-    else:
-        data['website'] = extracted_website
+       data['website'] = extracted_website # Assume valid initially
+    if extracted_website and data['email']:
+        email_parts = data['email'].split('@')
+        email_local_part = email_parts[0]
+        email_domain_part = email_parts[1] if len(email_parts) > 1 else None
+
+        # Normalize website slightly for comparison (remove http/https/www)
+        website_compare = re.sub(r'^(https?://)?(www\.)?', '', extracted_website, flags=re.IGNORECASE)
+
+        # Filter ONLY if website exactly matches email local part OR email domain part
+        if website_compare == email_local_part:
+            logger.warning(f"Ignoring website '{extracted_website}' as it exactly matches email local part '{email_local_part}'.")
+            data['website'] = None
+        elif email_domain_part and website_compare == email_domain_part:
+             logger.warning(f"Ignoring website '{extracted_website}' as it exactly matches email domain part '{email_domain_part}'.")
+             data['website'] = None
+
+    # Log the final decision
+    if data['website']:
+        logger.info(f"Assigned website: {data['website']}")
+    elif extracted_website and data['website'] is None:
+         logger.info(f"Filtered out potential website: {extracted_website}")
     # --- End Website Filtering ---
 
     person_name_assigned, person_name_line_index = _find_person(doc, data)
