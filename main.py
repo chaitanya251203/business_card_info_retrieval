@@ -396,7 +396,7 @@ def extract_information_spacy(text: str) -> dict:
 
     # Update data dict BEFORE calling title/address functions that use it for filtering
     data['job_title'] = _find_job_title(lines, lines_lower, person_name_assigned, person_name_line_index, data)
-
+    data['email'] = _extract_emails(text_cleaned)
     # Use the updated _assemble_address function
     data['address'] = _assemble_address(lines, lines_lower, locations, data)
 
