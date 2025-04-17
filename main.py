@@ -20,26 +20,22 @@ from google.cloud import vision
 from google.oauth2 import service_account # For loading creds from JSON content
 
 # --- Load Environment Variables ---
-# Load .env file BEFORE accessing os.environ below
-# This ensures variables are available for credential checks etc.
 load_dotenv()
-logger_init = logging.getLogger(__name__ + ".startup") # Temp logger for startup
-logger_init.setLevel(logging.INFO) # Ensure startup messages are shown
-handler = logging.StreamHandler() # Ensure handler exists if basicConfig hasn't run
+logger_init = logging.getLogger(__name__ + ".startup")
+logger_init.setLevel(logging.INFO)
+handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger_init.addHandler(handler)
-logger_init.propagate = False # Prevent duplicate messages if basicConfig runs later
-
+logger_init.propagate = False
 logger_init.info("Attempted to load environment variables from .env file.")
 
 # --- Configuration ---
-# Use basicConfig AFTER load_dotenv potentially sets logging config vars
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True) # force=True ensures it overwrites if logger_init added handlers
-logger = logging.getLogger(__name__) # Main application logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True)
+logger = logging.getLogger(__name__) # Main logger
 
 # --- Load spaCy Model ---
-NLP_MODEL = None # Initialize global variable for the model
+NLP_MODEL = None
 try:
     NLP_MODEL = spacy.load("en_core_web_sm")
     logger.info("spaCy model 'en_core_web_sm' loaded successfully.")
@@ -49,15 +45,14 @@ except OSError:
         "Please run 'python -m spacy download en_core_web_sm' "
         "in your virtual environment."
     )
-    # Extraction function will check if NLP_MODEL is None
 
 # --- Constants ---
-# Regex Patterns (Final check on patterns)
+# Regex Patterns (Validated)
 EMAIL_REGEX = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,}\b' # Allows 3+ digits at end
+PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,}\b'
 PHONE_PREFIX_REGEX = r'^([MFTWECP])[\s:+]+' # Capture prefix letter in Group 1
-WEBSITE_REGEX = r'\b(?<![@\w])(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z0-9.-]+[a-zA-Z]))\b' # TLD needs letter
-NAME_STRUCTURE_REGEX = r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){1,2}$' # Requires First Last (at least)
+WEBSITE_REGEX = r'\b(?<![@\w])(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z0-9.-]+[a-zA-Z]))\b'
+NAME_STRUCTURE_REGEX = r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){1,2}$'
 
 # Keywords
 ADDRESS_KEYWORDS = ['Plot', 'Avenue', 'Street', 'Road', 'Drive', 'P.O. Box', 'Box', 'Floor', 'Suite', 'Ste', 'Building', 'St', 'Rd', 'Ave', 'Ln']
@@ -69,7 +64,7 @@ JOB_TITLE_KEYWORDS = ['Officer', 'Manager', 'Director', 'Assistant', 'Engineer',
 app = FastAPI(
     title="Business Card Scanner API",
     description="Upload a business card image to extract information using Google Cloud Vision OCR + spaCy NER.",
-    version="1.3.5", # Updated version number reflecting final fixes
+    version="1.3.6", # Updated version number reflecting final fixes
 )
 
 # --- Pydantic Model for Response ---
@@ -78,9 +73,9 @@ class CardInfo(BaseModel):
     company_type: str | None = None
     person_name: str | None = None
     job_title: str | None = None
-    phone_number: str | None = None # Primary phone number
+    phone_number: str | None = None
     email: str | None = None
-    website: str | None = None # Added website
+    website: str | None = None
     address: str | None = None
 
 # --- File Handling Setup ---
@@ -104,17 +99,15 @@ def perform_ocr_google(image_path: str) -> str:
     """Performs OCR on an image file using Google Cloud Vision API."""
     try:
         logger.info(f"Performing Google Cloud Vision OCR on: {image_path}")
-        # --- Start Credential Handling ---
         client = None
         creds_path_or_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         if not creds_path_or_json:
              logger.error("GOOGLE_APPLICATION_CREDENTIALS environment variable not set.")
              raise ValueError("Google Credentials not configured.")
-
-        if os.path.isfile(creds_path_or_json): # Local dev: Path provided
+        if os.path.isfile(creds_path_or_json):
              logger.info("Using Google credentials from file path specified in ENV.")
-             client = vision.ImageAnnotatorClient() # SDK handles path automatically
-        else: # Deployed: Assume JSON content in ENV var
+             client = vision.ImageAnnotatorClient()
+        else:
              logger.info("Attempting to load Google credentials from ENV variable content.")
              try:
                  credentials_dict = json.loads(creds_path_or_json)
@@ -122,21 +115,15 @@ def perform_ocr_google(image_path: str) -> str:
                  client = vision.ImageAnnotatorClient(credentials=credentials)
                  logger.info("Successfully loaded Google credentials from ENV content.")
              except Exception as cred_err:
-                  logger.error(f"Failed to parse/load Google credentials from ENV variable content: {cred_err}", exc_info=True) # Log full error
+                  logger.error(f"Failed to parse/load Google credentials from ENV variable content: {cred_err}", exc_info=True)
                   raise ValueError(f"Invalid Google Credentials JSON in environment variable: {cred_err}")
-        # --- End Credential Handling ---
-
-        if client is None: # Safeguard
-             raise ValueError("Failed to initialize Google Vision client.")
-
+        if client is None: raise ValueError("Failed to initialize Google Vision client.")
         content = preprocess_image(image_path)
         image = vision.Image(content=content)
         response = client.document_text_detection(image=image)
-
         if response.error.message:
             logger.error(f"Google Cloud Vision API error: {response.error.message}")
             raise HTTPException(status_code=500, detail=f"Google Cloud Vision API error: {response.error.message}")
-
         if response.full_text_annotation:
             extracted_text = response.full_text_annotation.text
             logger.info("Google Cloud Vision OCR completed successfully.")
@@ -144,15 +131,9 @@ def perform_ocr_google(image_path: str) -> str:
         else:
             logger.warning("Google Cloud Vision did not detect any text.")
             return ""
-    except HTTPException as http_exc:
-        raise http_exc
-    except ValueError as val_err: # Catch credential config errors
-         logger.error(f"Configuration error during OCR: {val_err}", exc_info=True)
-         raise HTTPException(status_code=500, detail=f"Server Configuration Error: {val_err}")
-    except Exception as e:
-        logger.error(f"Error during Google Cloud OCR processing: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
-
+    except HTTPException as http_exc: raise http_exc
+    except ValueError as val_err: logger.error(f"Configuration error during OCR: {val_err}", exc_info=True); raise HTTPException(status_code=500, detail=f"Server Configuration Error: {val_err}")
+    except Exception as e: logger.error(f"Error during Google Cloud OCR processing: {e}", exc_info=True); raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
 
 # --- Helper Functions for Information Extraction ---
 
@@ -166,53 +147,41 @@ def _clean_text(text: str) -> tuple[str, list[str], list[str]]:
 def _extract_emails(text: str) -> str | None:
     """Extracts the most likely email address."""
     emails_found = re.findall(EMAIL_REGEX, text)
-    if emails_found:
-        logger.info(f"Regex found email(s): {emails_found}")
-        return emails_found[0] # Return first found
+    if emails_found: logger.info(f"Regex found email(s): {emails_found}"); return emails_found[0]
     return None
 
 def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]]:
-    """
-    Extracts phone numbers from text, scores them based on context,
-    and returns the most relevant (primary) phone number and a list of all found numbers with details.
-    """
-    phones_found = re.findall(PHONE_REGEX, text)
-    scored_phones = []; all_phones_details = []
+    """Extracts phone numbers, scores them, returns primary and all found."""
+    phones_found = re.findall(PHONE_REGEX, text); scored_phones = []; all_phones_details = []
     if phones_found:
         for phone in phones_found:
-            cleaned_phone = re.sub(r'[^\d+() -]', '', phone).strip()
-            digit_count = sum(c.isdigit() for c in cleaned_phone)
+            cleaned_phone = re.sub(r'[^\d+() -]', '', phone).strip(); digit_count = sum(c.isdigit() for c in cleaned_phone)
             if digit_count >= 7:
-                score = digit_count; context = "Other"
-                line_context = "" # Store line for context
+                score = digit_count; context = "Other"; line_context = ""
                 for line_idx, line in enumerate(lines):
                     if cleaned_phone in line:
-                        line_strip = line.strip()
-                        line_context = line_strip # Store the context line
+                        line_strip = line.strip(); line_context = line_strip
                         prefix_match = re.match(PHONE_PREFIX_REGEX, line_strip, re.IGNORECASE)
                         if prefix_match:
-                            score += 10
-                            prefix = prefix_match.group(1).upper() # Corrected: Use group(1) for the captured letter
+                            score += 10; prefix = prefix_match.group(1).upper() # Use group(1) for captured letter
                             if prefix == 'M': context = "Mobile"
                             elif prefix == 'F': context = "Fax"
                             elif prefix == 'T': context = "Tel"
                             elif prefix == 'P': context = "Phone"
                         if line_idx > len(lines) / 2: score += 2
-                        break # Break from inner line search loop
+                        break
                 scored_phones.append((score, cleaned_phone))
                 all_phones_details.append({"number": cleaned_phone, "type": context, "score": score, "line_context": line_context})
     primary_phone = None
     if scored_phones:
-        scored_phones.sort(key=lambda x: x[0], reverse=True)
-        primary_phone = scored_phones[0][1]
+        scored_phones.sort(key=lambda x: x[0], reverse=True); primary_phone = scored_phones[0][1]
         logger.info(f"Regex assigned primary phone (score {scored_phones[0][0]}): {primary_phone}")
-    all_phones_details.sort(key=lambda x: x['score'], reverse=True)
-    logger.debug(f"All scored phones details: {all_phones_details}") # Log details for debugging
+    all_phones_details.sort(key=lambda x: x['score'], reverse=True); logger.debug(f"All scored phones details: {all_phones_details}")
     return primary_phone, all_phones_details
 
 def _extract_websites(text: str) -> str | None:
     """Extracts the first likely website using the revised regex."""
-    matches = list(re.finditer(WEBSITE_REGEX, text))
+    matches = list(re.finditer(WEBSITE_REGEX, text));
     if not matches: return None
     first_match = matches[0]; domain_match = first_match.group(1); full_match_text = first_match.group(0).strip()
     full_url = domain_match
@@ -226,18 +195,15 @@ def _extract_websites(text: str) -> str | None:
 
 def _find_person(doc: spacy.tokens.Doc, extracted_data: dict) -> tuple[str | None, int]:
     """Finds the most likely person name using spaCy PERSON entities."""
-    persons = [ent for ent in doc.ents if ent.label_ == "PERSON"]
-    person_name_assigned = None; person_name_line_index = -1
+    persons = [ent for ent in doc.ents if ent.label_ == "PERSON"]; person_name_assigned = None; person_name_line_index = -1
     if persons:
         scored_persons = []
         for i, person_ent in enumerate(persons):
             name = person_ent.text.strip()
-            # Filters - Use .get() for safety in case keys not yet assigned
             if (extracted_data.get('email') and name in extracted_data['email']) or \
                (extracted_data.get('phone_number') and name in extracted_data['phone_number']) or \
                sum(c.isdigit() for c in name) > 0 or len(name.split()) > 4 or len(name.split()) < 2: continue
-            # Scoring
-            score = len(name)
+            score = len(name);
             if re.fullmatch(NAME_STRUCTURE_REGEX, name): score += 10
             line_idx = -1;
             try: start_char = person_ent.start_char; line_idx = doc.text[:start_char].count('\n');
@@ -245,24 +211,18 @@ def _find_person(doc: spacy.tokens.Doc, extracted_data: dict) -> tuple[str | Non
             if line_idx != -1 and line_idx < len(doc.text.split('\n')) / 3: score += 5
             scored_persons.append((score, name, line_idx))
         if scored_persons:
-             scored_persons.sort(key=lambda x: x[0], reverse=True)
-             person_name_assigned = scored_persons[0][1]
-             person_name_line_index = scored_persons[0][2]
+             scored_persons.sort(key=lambda x: x[0], reverse=True); person_name_assigned = scored_persons[0][1]; person_name_line_index = scored_persons[0][2]
              logger.info(f"spaCy assigned PERSON (score {scored_persons[0][0]}): {person_name_assigned} around line {person_name_line_index}")
     return person_name_assigned, person_name_line_index
 
 def _find_job_title(lines: list[str], lines_lower: list[str], person_name: str | None, person_name_line_index: int, extracted_data: dict) -> str | None:
     """Finds the job title, looking near person's name OR anywhere if keywords strong."""
-    job_title_assigned = None
-    potential_titles = []
-    start_search_index = 0 # Initialize for case where person not found
-    end_search_index = 3   # Initialize default search range
-
+    job_title_assigned = None; potential_titles = []
+    start_search_index = 0; end_search_index = 3
     if person_name and person_name_line_index != -1:
-        start_search_index = max(0, person_name_line_index)
-        end_search_index = min(len(lines), start_search_index + 3)
+        start_search_index = max(0, person_name_line_index); end_search_index = min(len(lines), start_search_index + 3)
         logger.info(f"Searching for job title near name (lines {start_search_index}-{end_search_index-1})...")
-        for i in range(start_search_index, end_search_index): # Loop to find title near name
+        for i in range(start_search_index, end_search_index):
             line = lines[i]; line_lower = lines_lower[i]
             if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS):
                  if line != person_name and \
@@ -270,56 +230,43 @@ def _find_job_title(lines: list[str], lines_lower: list[str], person_name: str |
                     not (extracted_data.get('phone_number') and extracted_data['phone_number'] in line) and \
                     not (extracted_data.get('company_name') and extracted_data['company_name'] in line) and \
                     len(line.split()) < 7:
-                      score = 100 - (i - start_search_index) # Score proximity
-                      potential_titles.append((score, line))
-                      job_title_assigned = line # Prioritize immediate match
+                      score = 100 - (i - start_search_index); potential_titles.append((score, line)); job_title_assigned = line;
                       logger.info(f"Assigned Job Title (near name): {job_title_assigned}")
                       return job_title_assigned # Return immediately
-
-    # Pass 2: If not found near name, search all lines
     if not job_title_assigned:
          logger.info("Job title not found near name, searching all lines...")
          for i, line in enumerate(lines):
-            # Skip lines already checked near name
-            if person_name and i >= start_search_index and i < end_search_index: continue
-            # Skip line if it's the person name
-            if person_name and line == person_name: continue
-
+            if (person_name and i >= start_search_index and i < end_search_index) or (person_name and line == person_name): continue
             line_lower = lines_lower[i]
             if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS):
                  if not (extracted_data.get('email') and extracted_data['email'] in line) and \
                     not (extracted_data.get('phone_number') and extracted_data['phone_number'] in line) and \
                     not (extracted_data.get('company_name') and extracted_data['company_name'] in line) and \
                     len(line.split()) < 7:
-                     score = 50 # Lower score for general matches
-                     potential_titles.append((score, line))
-
-    # Pick best from potential list if not found near name initially
+                     score = 50; potential_titles.append((score, line))
     if not job_title_assigned and potential_titles:
-        potential_titles.sort(key=lambda x: (x[0], len(x[1])), reverse=True) # Score, then length
-        job_title_assigned = potential_titles[0][1]
+        potential_titles.sort(key=lambda x: (x[0], len(x[1])), reverse=True); job_title_assigned = potential_titles[0][1]
         logger.info(f"Assigned Job Title (general search - score {potential_titles[0][0]}): {job_title_assigned}")
-
     return job_title_assigned
 
 def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | None, str | None]:
     """Finds the most likely organization name and type using spaCy ORG entities."""
-    orgs = [ent for ent in doc.ents if ent.label_ == "ORG"]
-    company_name_assigned = None; company_type_assigned = None
+    orgs = [ent for ent in doc.ents if ent.label_ == "ORG"]; company_name_assigned = None; company_type_assigned = None
     if orgs:
         scored_orgs = []
         for org_ent in orgs:
             org_name = org_ent.text.strip(); type_found_in_scoring = None
             if (person_name and org_name == person_name) or len(org_name) < 3: continue
-            score = len(org_name) * 1.5
-            has_suffix = False
-            for suffix in COMPANY_SUFFIXES:
+            score = len(org_name) * 1.5; has_suffix = False
+            for suffix in COMPANY_SUFFIXES: # Inner loop 1
                  if re.search(r'\b' + re.escape(suffix) + r'\b', org_name, re.IGNORECASE):
-                     score += 50; type_found_in_scoring = suffix; has_suffix = True; break
+                     score += 50; type_found_in_scoring = suffix; has_suffix = True;
+                     break # Correct break from suffix scoring check
             if not has_suffix:
-                for keyword in COMPANY_KEYWORDS:
+                for keyword in COMPANY_KEYWORDS: # Inner loop 2
                     if re.search(r'\b' + re.escape(keyword) + r'\b', org_name, re.IGNORECASE):
-                        score += 10; break
+                        score += 10;
+                        break # Correct break from keyword scoring check
             if org_name.isupper() and len(org_name) > 4: score += 5
             if any(addr_kw in org_name for addr_kw in ['Plot', 'Avenue', 'Road', 'Dist ']): score -= 15
             scored_orgs.append((score, org_name, type_found_in_scoring))
@@ -327,15 +274,23 @@ def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | Non
              scored_orgs.sort(key=lambda x: x[0], reverse=True)
              best_org_name = scored_orgs[0][1]; best_org_type_guess = scored_orgs[0][2]
              final_type = None; cleaned_org_name = best_org_name
-             if best_org_type_guess: match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
-             if match: final_type = match.group(0)
+             # Re-check chosen name accurately for suffix
+             if best_org_type_guess:
+                 match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
+                 if match: final_type = match.group(0)
              if not final_type:
-                  for suffix in COMPANY_SUFFIXES: match = re.search(r'\b' + re.escape(suffix) + r'\b', best_org_name, re.IGNORECASE);
-                  if match: final_type = match.group(0); break
+                  # Inner loop 3: Re-check suffix loop
+                  for suffix in COMPANY_SUFFIXES:
+                      match = re.search(r'\b' + re.escape(suffix) + r'\b', best_org_name, re.IGNORECASE);
+                      if match:
+                          final_type = match.group(0);
+                          # --- THIS BREAK IS CORRECTLY INSIDE THE FOR SUFFIX LOOP ---
+                          break
+             # Assign type and clean name
              if final_type:
                  company_type_assigned = final_type;
                  cleaned_org_name = re.sub(r'\b' + re.escape(final_type) + r'\b', '', cleaned_org_name, flags=re.IGNORECASE).strip(' ,')
-             cleaned_org_name = cleaned_org_name.replace('\n', ' ').strip()
+             cleaned_org_name = cleaned_org_name.replace('\n', ' ').strip() # Clean newlines
              company_name_assigned = cleaned_org_name;
              logger.info(f"spaCy assigned ORG (score {scored_orgs[0][0]}): {company_name_assigned} (Type: {company_type_assigned})")
     return company_name_assigned, company_type_assigned
@@ -350,11 +305,11 @@ def _assemble_address(lines: list[str], lines_lower: list[str], locations: list[
         has_keyword = any(keyword.lower() in line_lower for keyword in ADDRESS_KEYWORDS)
         has_zip_like = re.search(r'\b\d{4,7}\b', line) or re.search(r'\b\d{3}\s?\d{3}\b', line)
         has_location = any(loc_text in line_lower for loc_text in location_texts)
-        if has_keyword or has_location or has_zip_like:
-            candidate_indices.add(i)
+        if has_keyword or has_location or has_zip_like: candidate_indices.add(i)
     unique_address_parts = []; seen = set()
-    for i in sorted(list(candidate_indices)): # Process candidates in original order
+    for i in sorted(list(candidate_indices)):
         line = lines[i]; line_strip = line.strip(':., ')
+        # Filtering logic
         is_assigned_field = (person_name_assigned and line_strip == person_name_assigned) or \
                            (job_title_assigned and line_strip == job_title_assigned) or \
                            (company_name_assigned and company_type_assigned is None and line_strip == company_name_assigned) or \
@@ -364,21 +319,19 @@ def _assemble_address(lines: list[str], lines_lower: list[str], locations: list[
                            (website_assigned and website_assigned in line_strip)
         if is_assigned_field: continue
         line_cleaned_prefixes = re.sub(PHONE_PREFIX_REGEX, '', line_strip).strip()
-        if re.fullmatch(PHONE_REGEX, line_cleaned_prefixes): continue
-        if re.fullmatch(EMAIL_REGEX, line_strip): continue
+        if re.fullmatch(PHONE_REGEX, line_cleaned_prefixes) or re.fullmatch(EMAIL_REGEX, line_strip): continue
         website_match = re.search(WEBSITE_REGEX, line_strip)
         if website_match and len(website_match.group(0)) > len(line_strip) * 0.7: continue
-        if any(keyword.lower() in lines_lower[i] for keyword in JOB_TITLE_KEYWORDS) and \
-           not any(addr_kw.lower() in lines_lower[i] for addr_kw in ADDRESS_KEYWORDS) and \
+        if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS) and \
+           not any(addr_kw.lower() in line_lower for addr_kw in ADDRESS_KEYWORDS) and \
            not re.search(r'\d', line): continue
         if re.fullmatch(r'[\d\s/()-]+', line_strip) and not has_location and not has_zip_like: continue
         # Deduplicate before adding
         part_lower = line_strip.lower()
-        if part_lower not in seen:
-            unique_address_parts.append(line_strip)
-            seen.add(part_lower)
+        if part_lower not in seen: unique_address_parts.append(line_strip); seen.add(part_lower)
     if unique_address_parts:
         address_string = ", ".join(unique_address_parts);
+        # Final cleaning
         if company_name_assigned and company_name_assigned in address_string.split(', '): address_string = address_string.replace(company_name_assigned, '').strip(' ,')
         if company_type_assigned and company_type_assigned in address_string.split(', '): address_string = address_string.replace(company_type_assigned, '').strip(' ,')
         if job_title_assigned and job_title_assigned in address_string.split(', '): address_string = address_string.replace(job_title_assigned, '').strip(' ,')
@@ -397,7 +350,7 @@ def extract_information_spacy(text: str) -> dict:
         logger.error("spaCy model 'NLP_MODEL' object is None. Cannot perform NER.")
         return {"_error": "spaCy model not loaded"}
 
-    data = {
+    data = { # Initialize with all keys expected by CardInfo
         "company_name": None, "company_type": None, "person_name": None,
         "job_title": None, "phone_number": None, "email": None,
         "website": None, "address": None,
@@ -417,7 +370,7 @@ def extract_information_spacy(text: str) -> dict:
     extracted_website = _extract_websites(text_cleaned)
 
     # --- Website Filtering (Revised) ---
-    data['website'] = extracted_website
+    data['website'] = extracted_website # Assume valid initially
     if extracted_website and data['email']:
         email_parts = data['email'].split('@')
         email_local_part = email_parts[0]
@@ -436,6 +389,7 @@ def extract_information_spacy(text: str) -> dict:
     person_name_assigned, person_name_line_index = _find_person(doc, data)
     data['person_name'] = person_name_assigned
 
+    # Use the updated _find_org function
     company_name_assigned, company_type_assigned = _find_org(doc, person_name_assigned)
     data['company_name'] = company_name_assigned
     data['company_type'] = company_type_assigned
@@ -443,6 +397,7 @@ def extract_information_spacy(text: str) -> dict:
     # Update data dict BEFORE calling title/address functions that use it for filtering
     data['job_title'] = _find_job_title(lines, lines_lower, person_name_assigned, person_name_line_index, data)
 
+    # Use the updated _assemble_address function
     data['address'] = _assemble_address(lines, lines_lower, locations, data)
 
     logger.info(f"Information extraction finished. Data: {data}")
