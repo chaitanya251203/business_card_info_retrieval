@@ -46,7 +46,7 @@ except OSError:
 # --- Constants ---
 # Regex Patterns (Validated)
 EMAIL_REGEX = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{4,}\b'
+PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,}\b' # Changed last part to \d{3,}
 PHONE_PREFIX_REGEX = r'^[MFTWECP][\s:+]+'
 WEBSITE_REGEX = r'\b(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+)\b'
 NAME_STRUCTURE_REGEX = r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){1,2}$'
