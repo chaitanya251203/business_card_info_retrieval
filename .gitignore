@@ -1,0 +1,10 @@
+.env
+venv/
+/venv/
+__pycache__/
+temp_uploads/
+*.json # Be careful not to commit your key file!
+*.log
+.vscode/
+.idea/
+watchful-bonus-457020-h0-83900d6a037e.json
