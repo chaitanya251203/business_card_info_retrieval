@@ -277,13 +277,13 @@ def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | Non
             org_name = org_ent.text.strip(); type_found_in_scoring = None
             if (person_name and org_name == person_name) or len(org_name) < 3: continue
             score = len(org_name) * 1.5; has_suffix = False
-            for suffix in COMPANY_SUFFIXES: # Inner loop 1
+            for suffix in COMPANY_SUFFIXES:
                  if re.search(r'\b' + re.escape(suffix) + r'\b', org_name, re.IGNORECASE):
-                     score += 50; type_found_in_scoring = suffix; has_suffix = True; break # Correct break
+                     score += 50; type_found_in_scoring = suffix; has_suffix = True; break
             if not has_suffix:
-                for keyword in COMPANY_KEYWORDS: # Inner loop 2
+                for keyword in COMPANY_KEYWORDS:
                     if re.search(r'\b' + re.escape(keyword) + r'\b', org_name, re.IGNORECASE):
-                        score += 10; break # Correct break
+                        score += 10; break
             if org_name.isupper() and len(org_name) > 4: score += 5
             if any(addr_kw.lower() in org_name.lower() for addr_kw in ADDRESS_KEYWORDS[:4]): score -= 5 # Reduced penalty
             scored_orgs.append((score, org_name, type_found_in_scoring))
@@ -291,12 +291,22 @@ def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | Non
              scored_orgs.sort(key=lambda x: x[0], reverse=True)
              best_org_name = scored_orgs[0][1]; best_org_type_guess = scored_orgs[0][2]
              final_type = None; cleaned_org_name = best_org_name
-             if best_org_type_guess: match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
-             if match: final_type = match.group(0)
+
+             # --- CORRECTED SECTION ---
+             # Re-check chosen name accurately for suffix
+             if best_org_type_guess:
+                 match = None # Initialize match to None before the search
+                 match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
+                 if match: # Now this check is safe even if search returned None
+                      final_type = match.group(0)
+             # --- END CORRECTION ---
+
              if not final_type:
-                  for suffix in COMPANY_SUFFIXES: # Inner loop 3
+                  for suffix in COMPANY_SUFFIXES:
                       match = re.search(r'\b' + re.escape(suffix) + r'\b', best_org_name, re.IGNORECASE);
-                      if match: final_type = match.group(0); break # Correct break
+                      if match:
+                          final_type = match.group(0);
+                          break # Correct break
              if final_type:
                  company_type_assigned = final_type;
                  cleaned_org_name = re.sub(r'\b' + re.escape(final_type) + r'\b', '', cleaned_org_name, flags=re.IGNORECASE).strip(' ,')
