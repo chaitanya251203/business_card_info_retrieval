@@ -47,7 +47,7 @@ except OSError:
     )
 
 # --- Constants ---
-# Regex Patterns (Validated)
+# Regex Patterns (Validated & Refined)
 EMAIL_REGEX = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 PHONE_REGEX = r'(?:(?:Tel|Phone|Mobile|Mob|Fax|F)[:\s]*)?(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,}\b'
 PHONE_PREFIX_REGEX = r'^([MFTWECP])[\s:+]+' # Capture prefix letter in Group 1
@@ -55,10 +55,10 @@ WEBSITE_REGEX = r'\b(?<![@\w])(?:https?://|www\.)?\s?([a-zA-Z0-9][a-zA-Z0-9-]{0,
 NAME_STRUCTURE_REGEX = r'^[A-Z][a-z]+(?:\s+([A-Z][a-z.]+|[A-Z]\.)){1,2}$'
 
 # Keywords
-ADDRESS_KEYWORDS = ['Plot', 'Avenue', 'Street', 'Road', 'Drive', 'P.O. Box', 'Box', 'Floor', 'Suite', 'Ste', 'Building', 'St', 'Rd', 'Ave', 'Ln']
+ADDRESS_KEYWORDS = ['Plot', 'Avenue', 'Street', 'Road', 'Drive', 'P.O. Box', 'Box', 'Floor', 'Suite', 'Ste', 'Building', 'St', 'Rd', 'Ave', 'Ln', 'Dist ', 'Post ']
 COMPANY_SUFFIXES = ['Limited', 'Ltd', 'Inc', 'Corp', 'Solutions', 'Group', 'PLC', 'GmbH', 'LLC']
-COMPANY_KEYWORDS = ['Bank', 'Consulting', 'Media', 'Tech', 'Logistics', 'Holdings', 'Industries', 'Enterprises']
-JOB_TITLE_KEYWORDS = ['Officer', 'Manager', 'Director', 'Assistant', 'Engineer', 'Sales', 'Marketing', 'CEO', 'CTO', 'President', 'Specialist', 'Consultant', 'Analyst', 'Services', 'Executive', 'Representative', 'Procurement', 'Head']
+COMPANY_KEYWORDS = ['Bank', 'Consulting', 'Media', 'Tech', 'Logistics', 'Holdings', 'Industries', 'Enterprises', 'Biorefineries']
+JOB_TITLE_KEYWORDS = ['Officer', 'Manager', 'Director', 'Assistant', 'Engineer', 'Sales', 'Marketing', 'CEO', 'CTO', 'President', 'Specialist', 'Consultant', 'Analyst', 'Services', 'Executive', 'Representative', 'Procurement', 'Head', 'Accounts', 'General']
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
@@ -140,15 +140,23 @@ def perform_ocr_google(image_path: str) -> str:
 def _clean_text(text: str) -> tuple[str, list[str], list[str]]:
     """Basic text cleaning and line splitting."""
     text_cleaned = re.sub(r'\s{2,}', ' ', text.strip())
+    text_cleaned = re.sub(r'\n\s*[A-Za-z][\s:.]+\s+', '\n', text_cleaned) # Clean noise prefixes
     lines = [line.strip() for line in text_cleaned.split('\n') if line.strip()]
     lines_lower = [line.lower() for line in lines]
+    logger.debug(f"Cleaned text lines: {lines}")
     return text_cleaned, lines, lines_lower
 
 def _extract_emails(text: str) -> str | None:
     """Extracts the most likely email address."""
     emails_found = re.findall(EMAIL_REGEX, text)
-    if emails_found: logger.info(f"Regex found email(s): {emails_found}"); return emails_found[0]
-    return None
+    best_email = None
+    if emails_found:
+        best_email = emails_found[0]
+        for email in emails_found:
+             local_part = email.split('@')[0]
+             if '.' in local_part or '_' in local_part: best_email = email; break
+        logger.info(f"Selected email: {best_email}")
+    return best_email
 
 def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]]:
     """Extracts phone numbers, scores them, returns primary and all found."""
@@ -157,19 +165,21 @@ def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]
         for phone in phones_found:
             cleaned_phone = re.sub(r'[^\d+() -]', '', phone).strip(); digit_count = sum(c.isdigit() for c in cleaned_phone)
             if digit_count >= 7:
-                score = digit_count; context = "Other"; line_context = ""
+                score = digit_count; context = "Other"; line_context = ""; prefix_match = None
                 for line_idx, line in enumerate(lines):
-                    if cleaned_phone in line:
+                    if cleaned_phone in line or phone in line:
                         line_strip = line.strip(); line_context = line_strip
                         prefix_match = re.match(PHONE_PREFIX_REGEX, line_strip, re.IGNORECASE)
                         if prefix_match:
-                            score += 10; prefix = prefix_match.group(1).upper() # Use group(1) for captured letter
-                            if prefix == 'M': context = "Mobile"
-                            elif prefix == 'F': context = "Fax"
+                            score += 15; prefix = prefix_match.group(1).upper() # Use group(1) now
+                            if prefix == 'M': context = "Mobile"; score += 5
+                            elif prefix == 'F': context = "Fax"; score -= 5
                             elif prefix == 'T': context = "Tel"
                             elif prefix == 'P': context = "Phone"
                         if line_idx > len(lines) / 2: score += 2
                         break
+                if any(kw in line_context.lower() for kw in ADDRESS_KEYWORDS) and not prefix_match:
+                     score -= 10; logger.debug(f"Penalizing potential phone '{cleaned_phone}' on address line: {line_context}")
                 scored_phones.append((score, cleaned_phone))
                 all_phones_details.append({"number": cleaned_phone, "type": context, "score": score, "line_context": line_context})
     primary_phone = None
@@ -180,18 +190,26 @@ def _extract_phones(text: str, lines: list[str]) -> tuple[str | None, list[dict]
     return primary_phone, all_phones_details
 
 def _extract_websites(text: str) -> str | None:
-    """Extracts the first likely website using the revised regex."""
+    """Extracts the most likely website, preferring www/http and longer domains."""
     matches = list(re.finditer(WEBSITE_REGEX, text));
     if not matches: return None
-    first_match = matches[0]; domain_match = first_match.group(1); full_match_text = first_match.group(0).strip()
-    full_url = domain_match
-    if full_match_text.lower().startswith("www."): full_url = full_match_text
-    elif full_match_text.lower().startswith("https://"): full_url = full_match_text
-    elif full_match_text.lower().startswith("http://"): full_url = full_match_text
-    elif re.search(r'^[Ww][\s:.]+\s*' + re.escape(domain_match), text, re.MULTILINE): full_url = f"www.{domain_match}"
-    full_url = full_url.replace("www. ", "www.")
-    logger.info(f"Regex found potential website: {full_url}")
-    return full_url
+    scored_websites = []
+    for match in matches:
+        domain_match = match.group(1) or match.group(2); full_match_text = match.group(0).strip()
+        if not domain_match: continue # Skip if domain part wasn't captured
+        score = len(domain_match)
+        full_url = domain_match
+        if full_match_text.lower().startswith("www."): full_url = full_match_text; score += 10
+        elif full_match_text.lower().startswith("http"): full_url = full_match_text; score += 5
+        elif re.search(r'^[Ww][\s:.]+\s*' + re.escape(domain_match), text, re.MULTILINE): full_url = f"www.{domain_match}"; score += 10
+        full_url = full_url.replace("www. ", "www.")
+        scored_websites.append((score, full_url))
+    if scored_websites:
+         scored_websites.sort(key=lambda x: x[0], reverse=True)
+         best_website = scored_websites[0][1]
+         logger.info(f"Regex found potential websites, assigned (score {scored_websites[0][0]}): {best_website}")
+         return best_website
+    return None
 
 def _find_person(doc: spacy.tokens.Doc, extracted_data: dict) -> tuple[str | None, int]:
     """Finds the most likely person name using spaCy PERSON entities."""
@@ -203,7 +221,8 @@ def _find_person(doc: spacy.tokens.Doc, extracted_data: dict) -> tuple[str | Non
             if (extracted_data.get('email') and name in extracted_data['email']) or \
                (extracted_data.get('phone_number') and name in extracted_data['phone_number']) or \
                sum(c.isdigit() for c in name) > 0 or len(name.split()) > 4 or len(name.split()) < 2: continue
-            score = len(name);
+            if any(title_kw.lower() in name.lower() for title_kw in JOB_TITLE_KEYWORDS): continue
+            score = len(name)
             if re.fullmatch(NAME_STRUCTURE_REGEX, name): score += 10
             line_idx = -1;
             try: start_char = person_ent.start_char; line_idx = doc.text[:start_char].count('\n');
@@ -219,6 +238,7 @@ def _find_job_title(lines: list[str], lines_lower: list[str], person_name: str |
     """Finds the job title, looking near person's name OR anywhere if keywords strong."""
     job_title_assigned = None; potential_titles = []
     start_search_index = 0; end_search_index = 3
+    search_near_done = False
     if person_name and person_name_line_index != -1:
         start_search_index = max(0, person_name_line_index); end_search_index = min(len(lines), start_search_index + 3)
         logger.info(f"Searching for job title near name (lines {start_search_index}-{end_search_index-1})...")
@@ -232,18 +252,17 @@ def _find_job_title(lines: list[str], lines_lower: list[str], person_name: str |
                     len(line.split()) < 7:
                       score = 100 - (i - start_search_index); potential_titles.append((score, line)); job_title_assigned = line;
                       logger.info(f"Assigned Job Title (near name): {job_title_assigned}")
-                      return job_title_assigned # Return immediately
-    if not job_title_assigned:
-         logger.info("Job title not found near name, searching all lines...")
-         for i, line in enumerate(lines):
-            if (person_name and i >= start_search_index and i < end_search_index) or (person_name and line == person_name): continue
-            line_lower = lines_lower[i]
-            if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS):
-                 if not (extracted_data.get('email') and extracted_data['email'] in line) and \
-                    not (extracted_data.get('phone_number') and extracted_data['phone_number'] in line) and \
-                    not (extracted_data.get('company_name') and extracted_data['company_name'] in line) and \
-                    len(line.split()) < 7:
-                     score = 50; potential_titles.append((score, line))
+                      search_near_done = True; break # Correct break
+    if search_near_done: return job_title_assigned
+    logger.info("Job title not found near name, searching all lines...")
+    for i, line in enumerate(lines):
+        if (person_name and i >= start_search_index and i < end_search_index) or (person_name and line == person_name): continue
+        line_lower = lines_lower[i]
+        if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS):
+             if not (extracted_data.get('email') and extracted_data['email'] in line) and \
+                not (extracted_data.get('phone_number') and extracted_data['phone_number'] in line) and \
+                not (extracted_data.get('company_name') and extracted_data['company_name'] in line) and \
+                len(line.split()) < 7: score = 50; potential_titles.append((score, line))
     if not job_title_assigned and potential_titles:
         potential_titles.sort(key=lambda x: (x[0], len(x[1])), reverse=True); job_title_assigned = potential_titles[0][1]
         logger.info(f"Assigned Job Title (general search - score {potential_titles[0][0]}): {job_title_assigned}")
@@ -260,37 +279,28 @@ def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | Non
             score = len(org_name) * 1.5; has_suffix = False
             for suffix in COMPANY_SUFFIXES: # Inner loop 1
                  if re.search(r'\b' + re.escape(suffix) + r'\b', org_name, re.IGNORECASE):
-                     score += 50; type_found_in_scoring = suffix; has_suffix = True;
-                     break # Correct break from suffix scoring check
+                     score += 50; type_found_in_scoring = suffix; has_suffix = True; break # Correct break
             if not has_suffix:
                 for keyword in COMPANY_KEYWORDS: # Inner loop 2
                     if re.search(r'\b' + re.escape(keyword) + r'\b', org_name, re.IGNORECASE):
-                        score += 10;
-                        break # Correct break from keyword scoring check
+                        score += 10; break # Correct break
             if org_name.isupper() and len(org_name) > 4: score += 5
-            if any(addr_kw in org_name for addr_kw in ['Plot', 'Avenue', 'Road', 'Dist ']): score -= 15
+            if any(addr_kw.lower() in org_name.lower() for addr_kw in ADDRESS_KEYWORDS[:4]): score -= 5 # Reduced penalty
             scored_orgs.append((score, org_name, type_found_in_scoring))
         if scored_orgs:
              scored_orgs.sort(key=lambda x: x[0], reverse=True)
              best_org_name = scored_orgs[0][1]; best_org_type_guess = scored_orgs[0][2]
              final_type = None; cleaned_org_name = best_org_name
-             # Re-check chosen name accurately for suffix
-             if best_org_type_guess:
-                 match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
-                 if match: final_type = match.group(0)
+             if best_org_type_guess: match = re.search(r'\b' + re.escape(best_org_type_guess) + r'\b', best_org_name, re.IGNORECASE);
+             if match: final_type = match.group(0)
              if not final_type:
-                  # Inner loop 3: Re-check suffix loop
-                  for suffix in COMPANY_SUFFIXES:
+                  for suffix in COMPANY_SUFFIXES: # Inner loop 3
                       match = re.search(r'\b' + re.escape(suffix) + r'\b', best_org_name, re.IGNORECASE);
-                      if match:
-                          final_type = match.group(0);
-                          # --- THIS BREAK IS CORRECTLY INSIDE THE FOR SUFFIX LOOP ---
-                          break
-             # Assign type and clean name
+                      if match: final_type = match.group(0); break # Correct break
              if final_type:
                  company_type_assigned = final_type;
                  cleaned_org_name = re.sub(r'\b' + re.escape(final_type) + r'\b', '', cleaned_org_name, flags=re.IGNORECASE).strip(' ,')
-             cleaned_org_name = cleaned_org_name.replace('\n', ' ').strip() # Clean newlines
+             cleaned_org_name = cleaned_org_name.replace('\n', ' ').strip()
              company_name_assigned = cleaned_org_name;
              logger.info(f"spaCy assigned ORG (score {scored_orgs[0][0]}): {company_name_assigned} (Type: {company_type_assigned})")
     return company_name_assigned, company_type_assigned
@@ -298,45 +308,46 @@ def _find_org(doc: spacy.tokens.Doc, person_name: str | None) -> tuple[str | Non
 def _assemble_address(lines: list[str], lines_lower: list[str], locations: list[spacy.tokens.Token], data: dict) -> str | None:
     """Assembles the address from relevant lines, using less strict filtering."""
     address_parts = []; location_texts = {loc.text.strip().lower() for loc in locations if len(loc.text.strip()) > 2}
-    person_name_assigned = data.get('person_name'); job_title_assigned = data.get('job_title'); company_name_assigned = data.get('company_name'); company_type_assigned = data.get('company_type'); email_assigned = data.get('email'); phone_assigned = data.get('phone_number'); website_assigned = data.get('website')
+    person_name = data.get('person_name'); job_title = data.get('job_title'); company_name = data.get('company_name'); company_type = data.get('company_type'); email = data.get('email'); phone = data.get('phone_number'); website = data.get('website')
     candidate_indices = set()
     for i, line in enumerate(lines):
-        line_lower = lines_lower[i]
+        line_lower = lines_lower[i]; line_strip = line.strip(':., ')
         has_keyword = any(keyword.lower() in line_lower for keyword in ADDRESS_KEYWORDS)
-        has_zip_like = re.search(r'\b\d{4,7}\b', line) or re.search(r'\b\d{3}\s?\d{3}\b', line)
+        has_zip_like = re.search(r'\b(\d{6})\b', line_strip) or re.search(r'\b(\d{3}\s?\d{3})\b', line_strip) or re.search(r'\b(\d{4,5})\b', line_strip)
         has_location = any(loc_text in line_lower for loc_text in location_texts)
         if has_keyword or has_location or has_zip_like: candidate_indices.add(i)
     unique_address_parts = []; seen = set()
     for i in sorted(list(candidate_indices)):
         line = lines[i]; line_strip = line.strip(':., ')
-        # Filtering logic
-        is_assigned_field = (person_name_assigned and line_strip == person_name_assigned) or \
-                           (job_title_assigned and line_strip == job_title_assigned) or \
-                           (company_name_assigned and company_type_assigned is None and line_strip == company_name_assigned) or \
-                           (company_name_assigned and company_type_assigned and company_type_assigned in line_strip and company_name_assigned in line_strip) or \
-                           (email_assigned and line_strip == email_assigned) or \
-                           (phone_assigned and phone_assigned in line_strip) or \
-                           (website_assigned and website_assigned in line_strip)
+        # Filtering
+        is_assigned_field = (person_name and line_strip == person_name) or \
+                           (job_title and line_strip == job_title) or \
+                           (company_name and company_type is None and line_strip == company_name) or \
+                           (company_name and company_type and company_type in line_strip and company_name in line_strip) or \
+                           (email and line_strip == email) or \
+                           (phone and phone in line_strip) or \
+                           (website and website in line_strip)
         if is_assigned_field: continue
         line_cleaned_prefixes = re.sub(PHONE_PREFIX_REGEX, '', line_strip).strip()
-        if re.fullmatch(PHONE_REGEX, line_cleaned_prefixes) or re.fullmatch(EMAIL_REGEX, line_strip): continue
+        if re.fullmatch(PHONE_REGEX, line_cleaned_prefixes) and not has_keyword and not has_location: continue # Allow if also address line
+        if re.fullmatch(EMAIL_REGEX, line_strip): continue
         website_match = re.search(WEBSITE_REGEX, line_strip)
-        if website_match and len(website_match.group(0)) > len(line_strip) * 0.7: continue
+        if website_match and len(website_match.group(0)) > len(line_strip) * 0.7 and not has_keyword and not has_location: continue
         if any(keyword.lower() in line_lower for keyword in JOB_TITLE_KEYWORDS) and \
            not any(addr_kw.lower() in line_lower for addr_kw in ADDRESS_KEYWORDS) and \
            not re.search(r'\d', line): continue
-        if re.fullmatch(r'[\d\s/()-]+', line_strip) and not has_location and not has_zip_like: continue
-        # Deduplicate before adding
+        if re.fullmatch(r'[\d\s/()+-.,]+', line_strip) and not has_location and not has_zip_like and not has_keyword: continue # Filter lines ONLY numbers/symbols unless geo/zip/keyword
         part_lower = line_strip.lower()
         if part_lower not in seen: unique_address_parts.append(line_strip); seen.add(part_lower)
     if unique_address_parts:
         address_string = ", ".join(unique_address_parts);
         # Final cleaning
-        if company_name_assigned and company_name_assigned in address_string.split(', '): address_string = address_string.replace(company_name_assigned, '').strip(' ,')
-        if company_type_assigned and company_type_assigned in address_string.split(', '): address_string = address_string.replace(company_type_assigned, '').strip(' ,')
-        if job_title_assigned and job_title_assigned in address_string.split(', '): address_string = address_string.replace(job_title_assigned, '').strip(' ,')
+        if company_name and company_name in address_string.split(', '): address_string = address_string.replace(company_name, '').strip(' ,')
+        if company_type and company_type in address_string.split(', '): address_string = address_string.replace(company_type, '').strip(' ,')
+        if job_title and job_title in address_string.split(', '): address_string = address_string.replace(job_title, '').strip(' ,')
+        address_string = re.sub(r'^[MFTWECP][\s:.]+\s*', '', address_string).strip() # Remove leading contact prefixes
         address_string = re.sub(r'(,\s*,)+', ',', address_string).strip(' ,'); address_string = re.sub(r'\s{2,}', ' ', address_string).strip(' ,')
-        if address_string: logger.info(f"Assembled address (relaxed filter): {address_string}"); return address_string
+        if address_string: logger.info(f"Assembled address (refined filter v2): {address_string}"); return address_string
     logger.info("No address assembled.")
     return None
 
@@ -345,12 +356,12 @@ def extract_information_spacy(text: str) -> dict:
     """
     Extracts information using spaCy NER + Regex, refactored with helper functions.
     """
-    logger.info("Starting information extraction (Refactored v1.3.5).")
+    logger.info("Starting information extraction (Refactored v1.3.6).")
     if NLP_MODEL is None:
         logger.error("spaCy model 'NLP_MODEL' object is None. Cannot perform NER.")
         return {"_error": "spaCy model not loaded"}
 
-    data = { # Initialize with all keys expected by CardInfo
+    data = {
         "company_name": None, "company_type": None, "person_name": None,
         "job_title": None, "phone_number": None, "email": None,
         "website": None, "address": None,
@@ -369,35 +380,32 @@ def extract_information_spacy(text: str) -> dict:
     data['phone_number'], _ = _extract_phones(text_cleaned, lines) # Call updated function
     extracted_website = _extract_websites(text_cleaned)
 
-    # --- Website Filtering (Revised) ---
-    data['website'] = extracted_website # Assume valid initially
+    # Website Filtering
+    data['website'] = extracted_website
     if extracted_website and data['email']:
-        email_parts = data['email'].split('@')
-        email_local_part = email_parts[0]
+        email_parts = data['email'].split('@'); email_local_part = email_parts[0]
         email_domain_part = email_parts[1] if len(email_parts) > 1 else None
         website_compare = re.sub(r'^(https?://)?(www\.)?', '', extracted_website, flags=re.IGNORECASE)
         if website_compare == email_local_part:
             logger.warning(f"Ignoring website '{extracted_website}' as it matches email local part '{email_local_part}'.")
             data['website'] = None
         elif email_domain_part and website_compare == email_domain_part:
-             logger.warning(f"Ignoring website '{extracted_website}' as it matches email domain part '{email_domain_part}'.")
-             data['website'] = None
+             if not extracted_website.lower().startswith('www.') and not extracted_website.lower().startswith('http'):
+                  logger.warning(f"Ignoring website '{extracted_website}' as it matches email domain part '{email_domain_part}' and lacks prefix.")
+                  data['website'] = None
     if data['website']: logger.info(f"Assigned website: {data['website']}")
     elif extracted_website and data['website'] is None: logger.info(f"Filtered out potential website: {extracted_website}")
-    # --- End Website Filtering ---
 
+    # Find person, org, title, address using helper functions
     person_name_assigned, person_name_line_index = _find_person(doc, data)
     data['person_name'] = person_name_assigned
 
-    # Use the updated _find_org function
     company_name_assigned, company_type_assigned = _find_org(doc, person_name_assigned)
     data['company_name'] = company_name_assigned
     data['company_type'] = company_type_assigned
 
-    # Update data dict BEFORE calling title/address functions that use it for filtering
     data['job_title'] = _find_job_title(lines, lines_lower, person_name_assigned, person_name_line_index, data)
-    data['email'] = _extract_emails(text_cleaned)
-    # Use the updated _assemble_address function
+
     data['address'] = _assemble_address(lines, lines_lower, locations, data)
 
     logger.info(f"Information extraction finished. Data: {data}")
@@ -412,7 +420,6 @@ async def scan_business_card(
 ):
     """
     Receives card image, performs OCR (Google Vision), extracts info, returns JSON.
-    (No database interaction)
     """
     if not file.content_type.startswith("image/"):
         logger.warning(f"Invalid file type uploaded: {file.content_type}")
@@ -431,7 +438,7 @@ async def scan_business_card(
         logger.info("Temporary file saved successfully.")
 
         # --- OCR ---
-        raw_text_from_ocr = perform_ocr_google(temp_file_path) # Using Google Vision
+        raw_text_from_ocr = perform_ocr_google(temp_file_path)
 
         # --- Information Extraction ---
         extracted_data = extract_information_spacy(raw_text_from_ocr)
@@ -469,14 +476,12 @@ async def scan_business_card(
 @app.get("/", include_in_schema=False)
 def read_root():
     """Provides a simple welcome message for the API root."""
-    return {"message": "Business Card Scanner API v1.3.5 (No DB) is running. Go to /docs for API documentation."}
+    return {"message": "Business Card Scanner API v1.3.6 (No DB) is running. Go to /docs for API documentation."}
 
 # --- Main execution block ---
 if __name__ == "__main__":
-    # --- No Database Table Creation Call Here ---
-
     import uvicorn
-    logger.info("Starting Business Card Scanner API server (v1.3.5 No DB)...")
+    logger.info("Starting Business Card Scanner API server (v1.3.6 No DB)...")
     # Environment variable checks
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
          logger.warning("GOOGLE_APPLICATION_CREDENTIALS environment variable not set. Google Cloud Vision API calls will likely fail.")
